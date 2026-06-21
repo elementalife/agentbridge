@@ -2,6 +2,7 @@ param(
   [string] $Repo = $(if ($env:AGENTBRIDGE_RELEASE_REPO) { $env:AGENTBRIDGE_RELEASE_REPO } else { "elementalife/agentbridge" }),
   [string] $Tag = "",
   [switch] $NoRun,
+  [switch] $NoLaunch,
   [switch] $KeepDownloads,
   [switch] $Help
 )
@@ -26,6 +27,7 @@ Options:
   -Repo <owner/repo>
                     GitHub repository to download from.
   -NoRun            Download, verify, and extract, but do not run the setup exe.
+  -NoLaunch         Install, but do not launch AgentBridge after setup completes.
   -KeepDownloads    Leave downloaded and extracted files in the temp directory.
   -Help             Show this help.
 
@@ -43,6 +45,130 @@ function Write-Log {
 function Fail {
   param([string] $Message)
   throw "[agentbridge-install] $Message"
+}
+
+function Get-AgentBridgeLauncherPath {
+  $candidates = @()
+
+  if ($env:LOCALAPPDATA) {
+    $candidates += Join-Path $env:LOCALAPPDATA "dev.agentbridge.desktop\stable\app\bin\launcher.exe"
+  }
+
+  if ($env:APPDATA) {
+    $shortcutPaths = @(
+      (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AgentBridge.lnk"),
+      (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AgentBridge\AgentBridge.lnk")
+    )
+
+    foreach ($shortcutPath in $shortcutPaths) {
+      if (-not (Test-Path -LiteralPath $shortcutPath)) {
+        continue
+      }
+
+      try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        if ($shortcut.TargetPath -and $shortcut.TargetPath.EndsWith("launcher.exe", [StringComparison]::OrdinalIgnoreCase)) {
+          $candidates += $shortcut.TargetPath
+        }
+      } catch {
+        Write-Log "could not inspect shortcut ${shortcutPath}: $($_.Exception.Message)"
+      }
+    }
+  }
+
+  foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+function Get-AgentBridgeIconPath {
+  if (-not $env:LOCALAPPDATA) {
+    return $null
+  }
+
+  $iconPath = Join-Path $env:LOCALAPPDATA "dev.agentbridge.desktop\stable\app\Resources\app\assets\agentbridge-icon.ico"
+  if (Test-Path -LiteralPath $iconPath) {
+    return $iconPath
+  }
+
+  return $null
+}
+
+function Repair-AgentBridgeStartMenuIcon {
+  $iconPath = Get-AgentBridgeIconPath
+  if (-not $iconPath) {
+    Write-Log "could not find AgentBridge icon asset; leaving Start Menu shortcut icon unchanged"
+    return
+  }
+
+  if (-not $env:APPDATA) {
+    Write-Log "APPDATA is unavailable; leaving Start Menu shortcut icon unchanged"
+    return
+  }
+
+  $shortcutPaths = @(
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AgentBridge.lnk"),
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AgentBridge\AgentBridge.lnk")
+  )
+
+  $shell = New-Object -ComObject WScript.Shell
+  foreach ($shortcutPath in $shortcutPaths) {
+    if (-not (Test-Path -LiteralPath $shortcutPath)) {
+      continue
+    }
+
+    try {
+      $shortcut = $shell.CreateShortcut($shortcutPath)
+      $shortcut.IconLocation = "$iconPath,0"
+      $shortcut.Save()
+      Write-Log "updated Start Menu shortcut icon: $shortcutPath"
+    } catch {
+      Write-Log "could not update Start Menu shortcut icon ${shortcutPath}: $($_.Exception.Message)"
+    }
+  }
+}
+
+function Wait-AgentBridgeHealth {
+  param(
+    [string] $Url = "http://127.0.0.1:8181/health",
+    [int] $TimeoutSeconds = 30
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+      if ($response.StatusCode -eq 200) {
+        return $true
+      }
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+
+  return $false
+}
+
+function Start-AgentBridgeApp {
+  $launcherPath = Get-AgentBridgeLauncherPath
+  if (-not $launcherPath) {
+    Fail "AgentBridge setup completed, but the installed launcher.exe could not be found"
+  }
+
+  Write-Log "launching AgentBridge from $launcherPath"
+  Start-Process -FilePath $launcherPath -WorkingDirectory (Split-Path -Parent $launcherPath) | Out-Null
+
+  Write-Log "waiting for AgentBridge at http://127.0.0.1:8181/health"
+  if (-not (Wait-AgentBridgeHealth)) {
+    Fail "AgentBridge launched, but did not become healthy at http://127.0.0.1:8181/health"
+  }
+
+  Write-Log "AgentBridge is running at http://127.0.0.1:8181/"
 }
 
 if ($Help) {
@@ -153,6 +279,12 @@ try {
       Fail "setup exited with code $($process.ExitCode)"
     }
     Write-Log "AgentBridge setup completed"
+    Repair-AgentBridgeStartMenuIcon
+    if ($NoLaunch) {
+      Write-Log "skipped AgentBridge launch because -NoLaunch was set"
+    } else {
+      Start-AgentBridgeApp
+    }
   }
 } finally {
   if ($KeepDownloads) {
