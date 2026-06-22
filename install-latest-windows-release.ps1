@@ -133,6 +133,171 @@ function Repair-AgentBridgeStartMenuIcon {
   }
 }
 
+function Get-AgentBridgeInstallRoot {
+  if (-not $env:LOCALAPPDATA) {
+    return $null
+  }
+
+  return Join-Path $env:LOCALAPPDATA "dev.agentbridge.desktop"
+}
+
+function Get-AgentBridgeStableInstallRoot {
+  $installRoot = Get-AgentBridgeInstallRoot
+  if (-not $installRoot) {
+    return $null
+  }
+
+  return Join-Path $installRoot "stable"
+}
+
+function Get-AgentBridgeInstallSizeKb {
+  param([string] $Path)
+
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return 0
+  }
+
+  $bytes = 0
+  Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $bytes += $_.Length
+  }
+
+  return [int][Math]::Max(1, [Math]::Ceiling($bytes / 1KB))
+}
+
+function Quote-CommandArgument {
+  param([string] $Value)
+  return "`"$($Value.Replace('"', '\"'))`""
+}
+
+function Write-AgentBridgeUninstallerScript {
+  $installRoot = Get-AgentBridgeInstallRoot
+  if (-not $installRoot) {
+    Fail "LOCALAPPDATA is unavailable; cannot register AgentBridge uninstaller"
+  }
+
+  if (-not (Test-Path -LiteralPath $installRoot)) {
+    New-Item -ItemType Directory -Path $installRoot | Out-Null
+  }
+
+  $scriptPath = Join-Path $installRoot "Uninstall-AgentBridge.ps1"
+  $script = @'
+param(
+  [switch] $Quiet,
+  [switch] $RemoveUserData
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+
+function Remove-AgentBridgePath {
+  param([string] $Path)
+
+  if ($Path -and (Test-Path -LiteralPath $Path)) {
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+$localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+$appData = [Environment]::GetFolderPath("ApplicationData")
+$installRoot = Join-Path $localAppData "dev.agentbridge.desktop"
+$stableRoot = Join-Path $installRoot "stable"
+$installRootPrefix = $installRoot.TrimEnd("\") + "\"
+$userDataRoot = Join-Path $appData "AgentBridge"
+$startupPath = Join-Path $appData "Microsoft\Windows\Start Menu\Programs\Startup\AgentBridge.cmd"
+$startMenuShortcut = Join-Path $appData "Microsoft\Windows\Start Menu\Programs\AgentBridge.lnk"
+$uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentBridge"
+
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+  $processPath = $null
+  try {
+    $processPath = $_.Path
+  } catch {
+    $processPath = $null
+  }
+
+  if ($processPath -and $processPath.StartsWith($installRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Remove-Item -LiteralPath $startupPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $startMenuShortcut -Force -ErrorAction SilentlyContinue
+Remove-AgentBridgePath $stableRoot
+
+if ($RemoveUserData) {
+  Remove-AgentBridgePath $userDataRoot
+}
+
+Remove-Item -LiteralPath $uninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+
+try {
+  $remainingFiles = @(Get-ChildItem -LiteralPath $installRoot -Force -ErrorAction SilentlyContinue)
+  if ($remainingFiles.Count -eq 0) {
+    Remove-Item -LiteralPath $installRoot -Force -ErrorAction SilentlyContinue
+  }
+} catch {
+}
+
+if (-not $Quiet) {
+  Write-Host "AgentBridge has been uninstalled."
+  if (-not $RemoveUserData -and (Test-Path -LiteralPath $userDataRoot)) {
+    Write-Host "Logs and local config were kept at $userDataRoot."
+  }
+}
+'@
+
+  Set-Content -LiteralPath $scriptPath -Value $script -Encoding UTF8
+  return $scriptPath
+}
+
+function Set-AgentBridgeUninstallRegistryValue {
+  param(
+    [string] $KeyPath,
+    [string] $Name,
+    [object] $Value,
+    [string] $Type = "String"
+  )
+
+  New-ItemProperty -LiteralPath $KeyPath -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+function Register-AgentBridgeWindowsUninstaller {
+  param([string] $Version)
+
+  $stableRoot = Get-AgentBridgeStableInstallRoot
+  if (-not $stableRoot -or -not (Test-Path -LiteralPath $stableRoot)) {
+    Write-Log "could not find stable install root; skipping Windows uninstall registration"
+    return
+  }
+
+  $scriptPath = Write-AgentBridgeUninstallerScript
+  $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentBridge"
+  $uninstallCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $(Quote-CommandArgument $scriptPath)"
+  $quietUninstallCommand = "$uninstallCommand -Quiet"
+  $iconPath = Get-AgentBridgeIconPath
+  $launcherPath = Get-AgentBridgeLauncherPath
+  $displayIcon = if ($iconPath) { "$iconPath,0" } elseif ($launcherPath) { "$launcherPath,0" } else { $null }
+  $estimatedSizeKb = Get-AgentBridgeInstallSizeKb $stableRoot
+
+  New-Item -Path $uninstallKey -Force | Out-Null
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "DisplayName" "AgentBridge"
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "DisplayVersion" $Version
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "Publisher" "AgentBridge"
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "InstallLocation" $stableRoot
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "UninstallString" $uninstallCommand
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "QuietUninstallString" $quietUninstallCommand
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "NoModify" 1 "DWord"
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "NoRepair" 1 "DWord"
+  Set-AgentBridgeUninstallRegistryValue $uninstallKey "EstimatedSize" $estimatedSizeKb "DWord"
+
+  if ($displayIcon) {
+    Set-AgentBridgeUninstallRegistryValue $uninstallKey "DisplayIcon" $displayIcon
+  }
+
+  Write-Log "registered Windows uninstaller: $uninstallKey"
+}
+
 function Wait-AgentBridgeHealth {
   param(
     [string] $Url = "http://127.0.0.1:8181/health",
@@ -280,6 +445,8 @@ try {
     }
     Write-Log "AgentBridge setup completed"
     Repair-AgentBridgeStartMenuIcon
+    $displayVersion = if ($release.tag_name) { $release.tag_name.TrimStart("v") } else { $zipAsset.name }
+    Register-AgentBridgeWindowsUninstaller $displayVersion
     if ($NoLaunch) {
       Write-Log "skipped AgentBridge launch because -NoLaunch was set"
     } else {
